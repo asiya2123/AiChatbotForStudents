@@ -6,7 +6,7 @@ import express from "express";
 
 const scrypt = promisify(crypto.scrypt);
 const app = express();
-const port = Number(process.env.API_PORT || 3001);
+const port = Number(process.env.PORT || process.env.API_PORT || 3001);
 const dataFile = path.resolve(process.env.LUMILEARN_DB_PATH || path.join("server", "data", "lumilearn.json"));
 const dataDirectory = path.dirname(dataFile);
 const sessionCookie = "lumilearn_session";
@@ -79,8 +79,10 @@ function setSessionCookie(response, userId) {
   const token = crypto.randomBytes(32).toString("base64url");
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   sessions.set(tokenHash, { userId, expiresAt: Date.now() + sessionLifetime });
+  const crossSite = Boolean(process.env.APP_ORIGINS);
   const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
-  response.setHeader("Set-Cookie", `${sessionCookie}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetime / 1000}${secure}`);
+  const sameSite = crossSite ? "None" : "Lax";
+  response.setHeader("Set-Cookie", `${sessionCookie}=${token}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetime / 1000}${secure}`);
 }
 
 function clearSessionCookie(request, response) {
@@ -114,11 +116,37 @@ function validDate(value) {
 }
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 app.use((request, response, next) => {
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Referrer-Policy", "same-origin");
   response.setHeader("Cache-Control", "no-store");
   next();
+});
+app.use((request, response, next) => {
+  const origin = request.get("Origin");
+  if (!origin) return next();
+
+  const configuredOrigins = (process.env.APP_ORIGINS || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const sameOrigin = origin === `${request.get("x-forwarded-proto") || request.protocol}://${request.get("host")}`;
+  const localDevelopmentOrigin = process.env.NODE_ENV !== "production"
+    && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+  if (!sameOrigin && !configuredOrigins.includes(origin) && !localDevelopmentOrigin) {
+    return fail(response, 403, "This website is not allowed to use the ThriveMate API.");
+  }
+
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Access-Control-Allow-Credentials", "true");
+  response.setHeader("Vary", "Origin");
+  if (request.method === "OPTIONS") {
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    return response.status(204).end();
+  }
+  return next();
 });
 app.use(express.json({ limit: "32kb" }));
 
@@ -272,7 +300,10 @@ app.post("/api/chat", requireUser, async (request, response, next) => {
     if (!["English", "Hindi"].includes(language)) return fail(response, 400, "Choose a supported tutor language.");
     const now = Date.now();
     const recentRequests = (chatLimits.get(request.user.id) || []).filter((timestamp) => now - timestamp < 60_000);
-    if (recentRequests.length >= 20) return fail(response, 429, "Too many tutor requests. Please wait a minute and try again.");
+    if (recentRequests.length >= 20) {
+      response.setHeader("Retry-After", "60");
+      return fail(response, 429, "Too many tutor requests. Please wait a minute and try again.");
+    }
     recentRequests.push(now);
     chatLimits.set(request.user.id, recentRequests);
     const apiKey = process.env.GEMINI_API_KEY;
@@ -284,25 +315,39 @@ app.post("/api/chat", requireUser, async (request, response, next) => {
     }));
     history.push({ role: "user", parts: [{ text: prompt.trim() }] });
     const model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-    const result = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: `You are ThriveMate, a patient and accurate student assistant. Reply in ${language}. Explain concepts clearly in steps, ask short follow-up questions when useful, and help students learn rather than just giving unexplained answers. Adapt advice and examples to the student's stated class and subjects. For daily planning, create a realistic schedule with breaks and account for their priorities. For money management, provide age-appropriate financial literacy only; never request account credentials or recommend investments. For careers, offer practical exploration steps without guaranteeing jobs or outcomes. For quiz answers, explain why they are correct or incorrect. Do not claim to access private course materials.` }],
-        },
-        contents: history,
-        generationConfig: { temperature: 0.5, maxOutputTokens: 1200 },
-      }),
-      signal: AbortSignal.timeout(35_000),
+    const requestBody = JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: `You are ThriveMate, a patient and accurate student assistant. Reply in ${language}. Explain concepts clearly in steps, ask short follow-up questions when useful, and help students learn rather than just giving unexplained answers. Adapt advice and examples to the student's stated class and subjects. For daily planning, create a realistic schedule with breaks and account for their priorities. For money management, provide age-appropriate financial literacy only; never request account credentials or recommend investments. For careers, offer practical exploration steps without guaranteeing jobs or outcomes. For quiz answers, explain why they are correct or incorrect. Do not claim to access private course materials.` }],
+      },
+      contents: history,
+      generationConfig: { temperature: 0.5, maxOutputTokens: 1200 },
     });
+    let result;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        result = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          body: requestBody,
+          signal: AbortSignal.timeout(18_000),
+        });
+      } catch (error) {
+        if (attempt === 1 || error.name === "TimeoutError" || error.name === "AbortError") throw error;
+        console.error(`Gemini connection failed${error.cause?.code ? ` (${error.cause.code})` : ""}; retrying once.`);
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        continue;
+      }
+      if (result.status !== 503 || attempt === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
     if (!result.ok) {
       const providerError = await result.json().catch(() => null);
       const providerCode = providerError?.error?.status;
       const unavailable = result.status >= 500 || providerCode === "UNAVAILABLE" || providerCode === "INTERNAL";
       const status = result.status === 429 ? 429 : result.status === 401 || result.status === 403 || unavailable ? 503 : 502;
+      if (status === 429) response.setHeader("Retry-After", "60");
       const detail = status === 429
-        ? "Gemini is rate limiting requests. Wait a moment and try again."
+        ? "The tutor has reached its request limit. Please wait a minute before trying again."
         : status === 503
           ? unavailable
             ? "Gemini is temporarily unavailable. Please try again in a moment."
@@ -354,7 +399,7 @@ app.use((error, _request, response, _next) => {
   return fail(response, 500, "Unexpected server error. Please try again.");
 });
 
-app.listen(port, "127.0.0.1", () => {
+app.listen(port, "0.0.0.0", () => {
   console.log(`ThriveMate API listening on http://127.0.0.1:${port}`);
   console.log(`Gemini ${process.env.GEMINI_API_KEY ? "configured" : "not configured (set GEMINI_API_KEY in .env)"}`);
 });

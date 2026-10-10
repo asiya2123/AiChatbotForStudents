@@ -28,15 +28,28 @@ export interface Session {
   messages: ChatMessage[];
 }
 
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/+$/, "") || "";
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    credentials: "include",
-    headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...options.headers,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl}${url}`, {
+      ...options,
+      credentials: "include",
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...options.headers,
+      },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new Error("The tutor request timed out. Please try again.");
+    }
+    if (error instanceof TypeError) {
+      throw new Error("Could not connect to ThriveMate. Check that the backend is running.");
+    }
+    throw error;
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.error || `Request failed with status ${response.status}.`);
@@ -59,6 +72,10 @@ export const api = {
     request<StudyTask>(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "PATCH", body: JSON.stringify(update) }),
   deleteTask: (taskId: string) => request<void>(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" }),
   sendMessage: (message: string, language: "English" | "Hindi") =>
-    request<{ message: ChatMessage }>("/api/chat", { method: "POST", body: JSON.stringify({ message, language }) }),
+    request<{ message: ChatMessage }>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ message, language }),
+      signal: AbortSignal.timeout(40_000),
+    }),
   health: () => request<{ ok: boolean; aiConfigured: boolean; model: string }>("/api/health"),
 };

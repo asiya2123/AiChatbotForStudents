@@ -313,11 +313,27 @@ export default function App() {
   const [chatBusy, setChatBusy] = useState(false);
   const [chatError, setChatError] = useState("");
   const [failedQuestion, setFailedQuestion] = useState("");
+  const [chatCooldownUntil, setChatCooldownUntil] = useState(0);
+  const [chatCooldownSeconds, setChatCooldownSeconds] = useState(0);
   const [healthChecked, setHealthChecked] = useState(false);
   const isLifeToolsPage = ["Daily Life Planner", "Money Manager", "Career & Job Guide"].includes(activeSection);
   useEffect(() => {
     localStorage.setItem("lumilearn:language", language);
   }, [language]);
+  useEffect(() => {
+    if (!chatCooldownUntil) {
+      setChatCooldownSeconds(0);
+      return;
+    }
+    const updateCooldown = () => {
+      const remaining = Math.max(0, Math.ceil((chatCooldownUntil - Date.now()) / 1000));
+      setChatCooldownSeconds(remaining);
+      if (remaining === 0) setChatCooldownUntil(0);
+    };
+    updateCooldown();
+    const interval = window.setInterval(updateCooldown, 1000);
+    return () => window.clearInterval(interval);
+  }, [chatCooldownUntil]);
   useEffect(() => {
     if (screen !== "dashboard" || !studentEmail) return;
     const timerState = loadBreakState(studentEmail);
@@ -417,6 +433,7 @@ export default function App() {
     }),
     [courseFilter, searchQuery, selectedSubjects, studentStandard],
   );
+  const secondsUntilBreak = Math.ceil(Math.max(0, studyIntervalSeconds - studiedSeconds));
   const changeStandard = (standard: string) => {
     setStudentStandard(standard);
     const options = subjectOptionsFor(standard);
@@ -469,7 +486,7 @@ export default function App() {
 
   const sendMessage = async (text: string) => {
     const question = text.trim();
-    if (!question || chatBusy) return;
+    if (!question || chatBusy || chatCooldownSeconds > 0) return;
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", text: question, createdAt: new Date().toISOString() };
     setMessages((current) => [...current, userMessage]);
     setChatDraft("");
@@ -480,7 +497,11 @@ export default function App() {
       const response = await api.sendMessage(question, language);
       setMessages((current) => [...current, response.message]);
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : "Tutor request failed.");
+      const message = error instanceof Error ? error.message : "Tutor request failed.";
+      setChatError(message);
+      if (message.toLowerCase().includes("request limit") || message.toLowerCase().includes("rate limit") || message.toLowerCase().includes("too many tutor requests")) {
+        setChatCooldownUntil(Date.now() + 60_000);
+      }
       setFailedQuestion(question);
     } finally {
       setChatBusy(false);
@@ -783,11 +804,11 @@ export default function App() {
           {!healthChecked && <div role="status" className="mb-4 rounded-2xl bg-[#fff9e8] px-4 py-3 text-sm text-[#86630d]">Connecting to the ThriveMate backend…</div>}
           {apiError && <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-2xl bg-[#fff0ef] px-4 py-3 text-sm text-[#a9322b]"><span>{apiError}</span><button aria-label="Dismiss error" onClick={() => setApiError("")} className="rounded-full px-2 py-1 font-semibold hover:bg-white">×</button></div>}
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            {healthChecked && <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${aiConfigured ? "bg-[#e5f7ed] text-[#388361]" : "bg-[#fff4dd] text-[#8a5c0a]"}`}><span className={`h-2 w-2 rounded-full ${aiConfigured ? "bg-[#43ad79]" : "bg-[#e0a52d]"}`} />{aiConfigured ? `Gemini connected · ${aiModel}` : "Gemini needs a key · see .env setup"}</div>}
+            {healthChecked && <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${aiConfigured ? "bg-[#e5f7ed] text-[#388361]" : "bg-[#fff4dd] text-[#8a5c0a]"}`}><span className={`h-2 w-2 rounded-full ${aiConfigured ? "bg-[#43ad79]" : "bg-[#e0a52d]"}`} />{aiConfigured ? `Gemini configured · ${aiModel}` : "Gemini needs a key · see .env setup"}</div>}
             <div className="min-w-56 rounded-full bg-white px-4 py-2 text-xs text-[#5f6070] ring-1 ring-[#e9e7ec]" role="status" aria-live="polite">
               <div className="mb-1 flex items-center justify-between gap-3">
                 <span>{translate(breakSecondsLeft > 0 ? "Break time" : "Time until your next break", language)}</span>
-                <span className="font-mono font-semibold tabular-nums text-[#5c4eea]">{breakSecondsLeft > 0 ? `${Math.floor(breakSecondsLeft / 60)}:${String(breakSecondsLeft % 60).padStart(2, "0")}` : `${Math.floor(Math.max(0, studyIntervalSeconds - studiedSeconds) / 60)}:${String(Math.max(0, studyIntervalSeconds - studiedSeconds) % 60).padStart(2, "0")}`}</span>
+                <span className="font-mono font-semibold tabular-nums text-[#5c4eea]">{breakSecondsLeft > 0 ? `${Math.floor(breakSecondsLeft / 60)}:${String(breakSecondsLeft % 60).padStart(2, "0")}` : `${Math.floor(secondsUntilBreak / 60)}:${String(secondsUntilBreak % 60).padStart(2, "0")}`}</span>
               </div>
               <div className="h-1.5 overflow-hidden rounded-full bg-[#eeecf4]">
                 <div className={`h-full rounded-full transition-[width] ${breakSecondsLeft > 0 ? "bg-[#2d8d61]" : "bg-[#7059e8]"}`} style={{ width: `${breakSecondsLeft > 0 ? (1 - breakSecondsLeft / breakDurationSeconds) * 100 : (studiedSeconds / studyIntervalSeconds) * 100}%` }} />
@@ -1186,7 +1207,7 @@ export default function App() {
                     <div key={message.id} className={`max-w-[85%] whitespace-pre-line rounded-2xl px-4 py-3 text-sm ${message.role === "user" ? "ml-auto bg-[#6f5ae8] text-white" : "bg-white text-[#343442] ring-1 ring-[#eceaf3]"}`}>{message.text}</div>
                   ))}
                   {chatBusy && <div role="status" className="w-fit rounded-2xl bg-white px-4 py-3 text-sm text-[#68677b] ring-1 ring-[#eceaf3]">Gemini is thinking…</div>}
-                  {chatError && <div role="alert" className="rounded-2xl bg-[#fff0ef] p-3 text-sm text-[#a9322b]">{chatError}{failedQuestion && <button onClick={() => void sendMessage(failedQuestion)} disabled={chatBusy} className="ml-2 font-semibold underline">Retry</button>}</div>}
+                  {chatError && <div role="alert" className="rounded-2xl bg-[#fff0ef] p-3 text-sm text-[#a9322b]">{chatError}{failedQuestion && <button onClick={() => void sendMessage(failedQuestion)} disabled={chatBusy || chatCooldownSeconds > 0} className="ml-2 font-semibold underline">{chatCooldownSeconds > 0 ? `Retry in ${chatCooldownSeconds}s` : "Retry"}</button>}</div>}
                   {messages.length === 1 && (
                     <div className="flex flex-wrap gap-2">
                       {["Explain React hooks", "Help me study algorithms", "Make a quick quiz"].map((prompt) => (
@@ -1198,7 +1219,7 @@ export default function App() {
                 {!aiConfigured && <div role="alert" className="mx-4 rounded-xl bg-[#fff4dd] p-3 text-sm text-[#8a5c0a]">Add your Google AI Studio key as GEMINI_API_KEY in the project .env file, then restart <code>npm run dev</code>.</div>}
                 <form onSubmit={(event) => { event.preventDefault(); void sendMessage(chatDraft); }} className="flex gap-2 border-t border-[#e9e7ec] p-4">
                   <input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} disabled={chatBusy || !aiConfigured} placeholder="Ask your study question..." className="min-w-0 flex-1 rounded-full border border-[#e6e8ee] bg-white px-4 py-3 text-sm outline-none focus:border-[#a79bed] disabled:opacity-60" />
-                  <button disabled={chatBusy || !chatDraft.trim() || !aiConfigured} className="rounded-full bg-[#6f5ae8] px-5 py-3 text-sm font-semibold text-white hover:bg-[#5944d1] disabled:cursor-not-allowed disabled:opacity-50">{chatBusy ? "…" : "Send"}</button>
+                  <button disabled={chatBusy || chatCooldownSeconds > 0 || !chatDraft.trim() || !aiConfigured} className="rounded-full bg-[#6f5ae8] px-5 py-3 text-sm font-semibold text-white hover:bg-[#5944d1] disabled:cursor-not-allowed disabled:opacity-50">{chatBusy ? "…" : chatCooldownSeconds > 0 ? `${chatCooldownSeconds}s` : "Send"}</button>
                 </form>
               </>
             ) : (

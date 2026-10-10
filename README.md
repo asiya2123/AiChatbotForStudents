@@ -22,3 +22,5 @@ Use `npm run build` to create the production frontend. With `NODE_ENV=production
 - Daily planning, money management, and career guidance are available on their own dashboard pages.
 
 This is a local prototype. For public deployment, use a production database, HTTPS, backups, account recovery, and a production-grade session store.
+
+GitHub Pages can host only the static frontend; it cannot run this Node API. To deploy the working app, host the frontend and API together on a Node.js-capable service, or host the API separately and configure a secure HTTPS connection with credentialed CORS. Set `GEMINI_API_KEY` as a secret on the backend host only. Never add it to GitHub Pages settings, frontend build variables, or committed files. The `.env` file is ignored by Git.
